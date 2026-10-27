@@ -1,0 +1,3 @@
+# SpotifyDesk V2 get_refresh_token.py only uses Python 3 standard library:
+# - http.server, urllib, json, webbrowser, base64
+# No external pip dependencies required.

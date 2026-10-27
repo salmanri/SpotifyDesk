@@ -1,0 +1,23 @@
+# Sensitive Credentials
+**/config.h
+*.env
+credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.venv
+env/
+venv/
+ENV/
+
+# Arduino & Build Output
+*.build/
+*.bin
+*.hex
+*.elf
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
