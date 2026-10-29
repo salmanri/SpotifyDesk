@@ -115,6 +115,19 @@ static void netTask(void *)
           Serial.printf("[Sync] Initial lock %u ms\n", syncT.progressMs);
         }
       } else {
+        // Jika saat lagu mulai cover gagal terunduh (misal koneksi sempat sibuk),
+        // otomatis coba unduh ulang di poll berikutnya sampai gambar muncul!
+        if (!shared.hasCover && t.artUrl[0]) {
+          spotifyDisconnect();
+          if (artworkDownload(t.artUrl, cover)) {
+            lockState();
+            shared.hasCover = true;
+            memcpy(sharedCover, cover, COVER_BYTES);
+            shared.screenVersion++;
+            unlockState();
+          }
+        }
+
         // ===== Lagu sama: jaga timer lokal tetap mulus 1 detik tanpa loncat =====
         lockState();
         uint32_t local = shared.baseMs;

@@ -194,11 +194,13 @@ PollResult spotifyPoll(SpotifyTrack &out)
   JsonArray images = item["album"]["images"];
   int bestDiff = 100000;
   for (JsonObject img : images) {
-    int h = img["height"] | 0;
+    const char *u = img["url"] | "";
+    if (!u[0]) continue;
+    int h = img["height"] | 300;
     int diff = abs(h - 300);
-    if (diff < bestDiff) {
+    if (diff < bestDiff || out.artUrl[0] == '\0') {
       bestDiff = diff;
-      strlcpy(out.artUrl, img["url"] | "", sizeof(out.artUrl));
+      strlcpy(out.artUrl, u, sizeof(out.artUrl));
     }
   }
   return POLL_OK;

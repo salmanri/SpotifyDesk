@@ -7,7 +7,7 @@ struct SpotifyTrack {
   char title[96];
   char artist[96];
   char album[96];
-  char artUrl[160];
+  char artUrl[200];
   uint32_t progressMs;
   uint32_t durationMs;
   bool playing;
