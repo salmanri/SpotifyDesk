@@ -2,7 +2,7 @@
 //
 // ARSITEKTUR DUAL-CORE:
 //   Core 0 (netTask)  : Wi-Fi, Spotify API (keep-alive), download cover, lirik.
-//   Core 1 (loop)     : layar e-paper — progress bar tiap detik & lirik,
+//   Core 1 (loop)     : layar e-paper — progress bar tiap 1 detik & lirik,
 //                       TIDAK PERNAH menunggu jaringan. Hasilnya semulus V1.
 //
 // Board   : DOIT ESP32 DevKit V1
@@ -60,6 +60,7 @@ static void netTask(void *)
   static uint8_t cover[COVER_BYTES];
   char currentId[40] = "";
   int nothingCount = 0;
+  int driftHits = 0;
   SpotifyTrack t;
 
   for (;;) {
@@ -74,6 +75,7 @@ static void netTask(void *)
       if (strcmp(t.id, currentId) != 0) {
         // ===== Lagu baru =====
         strlcpy(currentId, t.id, sizeof(currentId));
+        driftHits = 0;
         Serial.printf("\n[Track] %s — %s\n", t.title, t.artist);
         Serial.printf("[Mem] heap %u, blok max %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
@@ -113,23 +115,33 @@ static void netTask(void *)
           Serial.printf("[Sync] Initial lock %u ms\n", syncT.progressMs);
         }
       } else {
-        // ===== Lagu sama: sinkron play/pause & koreksi drift teredam =====
+        // ===== Lagu sama: jaga timer lokal tetap mulus 1 detik tanpa loncat =====
         lockState();
         uint32_t local = shared.baseMs;
         if (shared.playing) local += (uint32_t)(t.respMillis - shared.baseMillis);
         int32_t drift = (int32_t)t.progressMs - (int32_t)local;
 
-        if (t.playing != shared.playing || abs(drift) > 800) {
-          // Perubahan play/pause atau seek jauh -> snap langsung
+        if (t.playing != shared.playing || abs(drift) >= 1500) {
+          // Perubahan play/pause atau user melakukan seek -> snap langsung
           shared.playing = t.playing;
           shared.baseMs = t.progressMs;
           shared.baseMillis = t.respMillis;
-          if (abs(drift) > 800) Serial.printf("[Sync] Snap drift %d ms\n", (int)drift);
-        } else if (abs(drift) >= 120) {
-          // Drift moderat (120..800 ms) -> koreksi halus 2/3 agar kebal jitter API
-          shared.baseMs = (uint32_t)((int32_t)local + (drift * 2) / 3);
-          shared.baseMillis = t.respMillis;
-          Serial.printf("[Sync] Smooth drift %d ms\n", (int)drift);
+          driftHits = 0;
+          if (abs(drift) >= 1500) Serial.printf("[Sync] Seek/snap %d ms\n", (int)drift);
+        } else if (abs(drift) >= 300) {
+          // Hanya koreksi jika drift konsisten ke arah yang sama selama 3x poll berturut-turut
+          int dir = (drift > 0) ? 1 : -1;
+          if ((driftHits > 0 && dir > 0) || (driftHits < 0 && dir < 0)) driftHits += dir;
+          else driftHits = dir;
+
+          if (abs(driftHits) >= 3) {
+            shared.baseMs = (uint32_t)((int32_t)local + drift / 2);
+            shared.baseMillis = t.respMillis;
+            driftHits = 0;
+            Serial.printf("[Sync] Smooth drift %d ms\n", (int)drift);
+          }
+        } else {
+          driftHits = 0;
         }
         unlockState();
       }
@@ -206,11 +218,16 @@ void loop()
     seenVersion = s.screenVersion;
     if (!s.active) {
       displayDrawIdle();
+      lastSec = UINT32_MAX;
     } else {
       displayDrawTrack(s.title, s.artist, s.album, s.hasCover ? cover : nullptr,
                        sec, s.durationMs / 1000, s.playing, lyric);
+      // Hitung ulang detik terkini seusai full refresh (~1.8s) agar langsung lanjut per 1 detik
+      uint32_t nowMs = s.baseMs;
+      if (s.playing) nowMs += (uint32_t)(millis() - s.baseMillis);
+      if (s.durationMs && nowMs > s.durationMs) nowMs = s.durationMs;
+      lastSec = nowMs / 1000;
     }
-    lastSec = sec;
     lastPlaying = s.playing;
     strlcpy(lastLyric, lyric, sizeof(lastLyric));
   } else if (s.active) {
@@ -221,17 +238,15 @@ void loop()
       lastSec = sec;
       lastPlaying = s.playing;
     } else if (sec != lastSec || s.playing != lastPlaying) {
-      // Lookahead 750ms: jangan mulai partial refresh progress bar jika lirik baru
-      // akan muncul dalam < 750ms (karena refresh e-paper memakan ~400ms)
+      // Hanya tunda maksimal 220ms jika lirik baru akan masuk tepat di awal detik ini,
+      // sehingga detik tetap ter-update setiap 1 detik penuh (tidak pernah melompat)
       uint32_t nextMs = lyricsGetNextChangeMs(posMs, LYRIC_LEAD_MS);
-      bool lyricComingSoon = (nextMs != UINT32_MAX && nextMs > posMs && (nextMs - posMs) < 750);
+      bool lyricRightNow = (nextMs != UINT32_MAX && nextMs > posMs && (nextMs - posMs) <= 220);
 
-      if (!lyricComingSoon) {
-        if (s.playing != lastPlaying || (sec - lastSec >= 2) || (lastSec == UINT32_MAX)) {
-          displayUpdateTransport(sec, s.durationMs / 1000, s.playing);
-          lastSec = sec;
-          lastPlaying = s.playing;
-        }
+      if (!lyricRightNow || s.playing != lastPlaying) {
+        displayUpdateTransport(sec, s.durationMs / 1000, s.playing);
+        lastSec = sec;
+        lastPlaying = s.playing;
       }
     }
   }
