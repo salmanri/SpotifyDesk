@@ -1,4 +1,4 @@
-// lyrics.cpp — Client LRCLIB dengan sinkronisasi presisi & durasi match
+// lyrics.cpp — Client LRCLIB dengan sinkronisasi presisi, tag [offset], & durasi match
 #include "lyrics.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -11,6 +11,7 @@
 static LyricLine lines[MAX_LYRIC_LINES];
 static int lineCount = 0;
 static int stagingCount = 0;
+static int32_t lrcOffsetMs = 0;
 static SemaphoreHandle_t lyrMutex = nullptr;
 
 static void ensureMutex()
@@ -24,6 +25,7 @@ void lyricsReset()
   xSemaphoreTake(lyrMutex, portMAX_DELAY);
   lineCount = 0;
   stagingCount = 0;
+  lrcOffsetMs = 0;
   xSemaphoreGive(lyrMutex);
 }
 
@@ -60,9 +62,14 @@ static bool parseUInt(const char *&p, int &val, int &digits)
   return digits > 0;
 }
 
-// Parse satu baris LRC: "[mm:ss.xx][mm:ss.xx] teks"
+// Parse satu baris LRC: "[mm:ss.xx][mm:ss.xx] teks" atau "[offset:+/-ms]"
 static void parseLrcLine(char *line)
 {
+  if (strncmp(line, "[offset:", 8) == 0 || strncmp(line, "[OFFSET:", 8) == 0) {
+    lrcOffsetMs = atoi(line + 8);
+    return;
+  }
+
   const char *p = line;
   uint32_t times[4];
   int nt = 0;
@@ -133,7 +140,7 @@ static void appendUtf8(char *buf, int &li, int cap, uint32_t cp)
   }
 }
 
-// Baca stream JSON. Jika filterDurationSec > 0 (saat search), lewati hasil dengan durasi beda > 5 detik.
+// Baca stream JSON. Jika filterDurationSec > 0 (saat search), lewati hasil dengan durasi beda > 2 detik.
 static bool streamSyncedLyrics(WiFiClient *s, int filterDurationSec)
 {
   static const char KEY_DUR[] = "\"duration\":";
@@ -158,20 +165,22 @@ static bool streamSyncedLyrics(WiFiClient *s, int filterDurationSec)
       if (c == KEY_DUR[kpos_dur]) {
         if (++kpos_dur == KLEN_DUR) {
           kpos_dur = 0;
-          // Baca angka durasi
           int durVal = 0;
+          int firstFrac = 0;
           bool inFrac = false;
           while (true) {
             int d = readByteTimeout(s, 4000);
             if (d < 0) break;
             if (d >= '0' && d <= '9') {
               if (!inFrac) durVal = durVal * 10 + (d - '0');
+              else if (firstFrac == 0) firstFrac = (d - '0');
             } else if (d == '.') {
               inFrac = true;
             } else if (d != ' ') {
               break;
             }
           }
+          if (firstFrac >= 5) durVal++;
           curDuration = durVal;
         }
       } else {
@@ -193,8 +202,9 @@ static bool streamSyncedLyrics(WiFiClient *s, int filterDurationSec)
 
           if (quote == '"') {
             // Cek apakah durasi cocok (jika filter aktif)
-            if (filterDurationSec > 0 && curDuration > 0 && abs(curDuration - filterDurationSec) > 5) {
+            if (filterDurationSec > 0 && curDuration > 0 && abs(curDuration - filterDurationSec) > 2) {
               Serial.printf("[Lyrics] Lewati durasi %d s (target %d s)\n", curDuration, filterDurationSec);
+              curDuration = 0;
               // Skip isi string sampai closing quote
               bool esc = false;
               while (true) {
@@ -211,6 +221,7 @@ static bool streamSyncedLyrics(WiFiClient *s, int filterDurationSec)
             st = IN_STRING;
             li = 0;
             stagingCount = 0;
+            lrcOffsetMs = 0;
           }
         }
       } else {
@@ -290,7 +301,7 @@ static bool fetchUrl(const String &url, int filterDurationSec)
   http.setConnectTimeout(8000);
   http.setTimeout(8000);
   if (!http.begin(client, url)) return false;
-  http.addHeader("User-Agent", "SpotifyDeskV2/2.0 (https://github.com/)");
+  http.addHeader("User-Agent", "SpotifyDeskV2/2.0 (https://github.com/salmanri/SpotifyDesk)");
   int code = http.GET();
   bool ok = false;
   if (code == 200) ok = streamSyncedLyrics(http.getStreamPtr(), filterDurationSec);
@@ -301,6 +312,14 @@ static bool fetchUrl(const String &url, int filterDurationSec)
 
 static int publish()
 {
+  // Terapkan tag [offset:+/-ms] jika ada di dalam file LRC
+  if (lrcOffsetMs != 0) {
+    for (int i = 0; i < stagingCount; i++) {
+      int32_t t = (int32_t)lines[i].time_ms - lrcOffsetMs;
+      lines[i].time_ms = (t > 0) ? (uint32_t)t : 0;
+    }
+  }
+
   for (int i = 1; i < stagingCount; i++) {
     LyricLine tmp = lines[i];
     int j = i - 1;
@@ -310,7 +329,7 @@ static int publish()
   xSemaphoreTake(lyrMutex, portMAX_DELAY);
   lineCount = stagingCount;
   xSemaphoreGive(lyrMutex);
-  Serial.printf("[Lyrics] %d baris dimuat & sinkron\n", stagingCount);
+  Serial.printf("[Lyrics] %d baris dimuat & sinkron (offset %d ms)\n", stagingCount, (int)lrcOffsetMs);
   return stagingCount;
 }
 
@@ -328,13 +347,24 @@ int lyricsFetch(const char *title, const char *artist, const char *album, int du
   char ct[96];
   cleanTitle(title, ct, sizeof(ct));
 
-  // 1. Pencocokan langsung (tanpa album_name agar varian album Deluxe/Anniversary tidak gagal)
-  String url = "https://lrclib.net/api/get?track_name=" + urlEncode(title) +
-               "&artist_name=" + urlEncode(firstArtist) +
-               "&duration=" + String(durationSec);
+  String url;
+
+  // 1. Pencocokan paling spesifik: judul + artis + album + durasi
+  if (album && album[0]) {
+    url = "https://lrclib.net/api/get?track_name=" + urlEncode(title) +
+          "&artist_name=" + urlEncode(firstArtist) +
+          "&album_name=" + urlEncode(album) +
+          "&duration=" + String(durationSec);
+    if (fetchUrl(url, 0)) return publish();
+  }
+
+  // 2. Pencocokan langsung tanpa album_name (agar varian album Deluxe/Anniversary tetap cocok)
+  url = "https://lrclib.net/api/get?track_name=" + urlEncode(title) +
+        "&artist_name=" + urlEncode(firstArtist) +
+        "&duration=" + String(durationSec);
   if (fetchUrl(url, 0)) return publish();
 
-  // 2. Jika judul ada keterangan tambahan (Remastered/feat), coba dengan judul bersih
+  // 3. Jika judul ada keterangan tambahan (Remastered/feat), coba dengan judul bersih
   if (strcmp(ct, title) != 0 && strlen(ct) > 0) {
     url = "https://lrclib.net/api/get?track_name=" + urlEncode(ct) +
           "&artist_name=" + urlEncode(firstArtist) +
@@ -342,7 +372,7 @@ int lyricsFetch(const char *title, const char *artist, const char *album, int du
     if (fetchUrl(url, 0)) return publish();
   }
 
-  // 3. Fallback search (dengan filter durasi agar tidak salah mengambil versi live/akustik)
+  // 4. Fallback search (dengan filter durasi presisi +-2 detik agar tidak salah mengambil versi radio/live)
   url = "https://lrclib.net/api/search?track_name=" + urlEncode(ct) +
         "&artist_name=" + urlEncode(firstArtist);
   if (fetchUrl(url, durationSec)) return publish();
@@ -385,4 +415,30 @@ void lyricsGetCurrent(uint32_t positionMs, int leadMs, char *out, size_t outLen)
     }
   }
   xSemaphoreGive(lyrMutex);
+}
+
+uint32_t lyricsGetNextChangeMs(uint32_t positionMs, int leadMs)
+{
+  uint32_t nextChange = UINT32_MAX;
+  ensureMutex();
+  xSemaphoreTake(lyrMutex, portMAX_DELAY);
+  int n = lineCount;
+  if (n > 0) {
+    int32_t p = (int32_t)positionMs + leadMs;
+    uint32_t pos = (p > 0) ? (uint32_t)p : 0;
+    int idx = -1;
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+      int mid = (lo + hi) / 2;
+      if (lines[mid].time_ms <= pos) { idx = mid; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    if (idx < 0) {
+      nextChange = lines[0].time_ms;
+    } else if (idx + 1 < n) {
+      nextChange = lines[idx + 1].time_ms;
+    }
+  }
+  xSemaphoreGive(lyrMutex);
+  return nextChange;
 }

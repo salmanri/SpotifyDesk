@@ -96,20 +96,40 @@ static void netTask(void *)
         shared.screenVersion++;
         unlockState();
 
-        // Lirik diambil SETELAH layar digambar -> lagu tampil secepat mungkin
-        lyricsFetch(t.title, t.artist, t.album, t.durationMs / 1000);
+        // Ambil lirik setelah layar mulai digambar (durasi dibulatkan ke detik terdekat)
+        int durSec = (int)((t.durationMs + 500) / 1000);
+        lyricsFetch(t.title, t.artist, t.album, durSec);
         Serial.printf("[Mem] heap %u\n", ESP.getFreeHeap());
+
+        // Re-sync segera setelah cover & lirik selesai diunduh agar posisi waktu
+        // bebas dari jeda buffering awal transisi lagu di Spotify
+        SpotifyTrack syncT;
+        if (spotifyPoll(syncT) == POLL_OK && strcmp(syncT.id, currentId) == 0) {
+          lockState();
+          shared.playing = syncT.playing;
+          shared.baseMs = syncT.progressMs;
+          shared.baseMillis = syncT.respMillis;
+          unlockState();
+          Serial.printf("[Sync] Initial lock %u ms\n", syncT.progressMs);
+        }
       } else {
-        // ===== Lagu sama: sinkron play/pause & seek =====
+        // ===== Lagu sama: sinkron play/pause & koreksi drift teredam =====
         lockState();
         uint32_t local = shared.baseMs;
         if (shared.playing) local += (uint32_t)(t.respMillis - shared.baseMillis);
         int32_t drift = (int32_t)t.progressMs - (int32_t)local;
-        if (t.playing != shared.playing || abs(drift) > 1500) {
+
+        if (t.playing != shared.playing || abs(drift) > 800) {
+          // Perubahan play/pause atau seek jauh -> snap langsung
           shared.playing = t.playing;
           shared.baseMs = t.progressMs;
           shared.baseMillis = t.respMillis;
-          if (abs(drift) > 1500) Serial.printf("[Sync] koreksi %d ms\n", drift);
+          if (abs(drift) > 800) Serial.printf("[Sync] Snap drift %d ms\n", (int)drift);
+        } else if (abs(drift) >= 120) {
+          // Drift moderat (120..800 ms) -> koreksi halus 2/3 agar kebal jitter API
+          shared.baseMs = (uint32_t)((int32_t)local + (drift * 2) / 3);
+          shared.baseMillis = t.respMillis;
+          Serial.printf("[Sync] Smooth drift %d ms\n", (int)drift);
         }
         unlockState();
       }
@@ -201,9 +221,18 @@ void loop()
       lastSec = sec;
       lastPlaying = s.playing;
     } else if (sec != lastSec || s.playing != lastPlaying) {
-      displayUpdateTransport(sec, s.durationMs / 1000, s.playing);
-      lastSec = sec;
-      lastPlaying = s.playing;
+      // Lookahead 750ms: jangan mulai partial refresh progress bar jika lirik baru
+      // akan muncul dalam < 750ms (karena refresh e-paper memakan ~400ms)
+      uint32_t nextMs = lyricsGetNextChangeMs(posMs, LYRIC_LEAD_MS);
+      bool lyricComingSoon = (nextMs != UINT32_MAX && nextMs > posMs && (nextMs - posMs) < 750);
+
+      if (!lyricComingSoon) {
+        if (s.playing != lastPlaying || (sec - lastSec >= 2) || (lastSec == UINT32_MAX)) {
+          displayUpdateTransport(sec, s.durationMs / 1000, s.playing);
+          lastSec = sec;
+          lastPlaying = s.playing;
+        }
+      }
     }
   }
 

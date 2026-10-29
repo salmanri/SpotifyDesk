@@ -121,7 +121,7 @@ PollResult spotifyPoll(SpotifyTrack &out)
 
   unsigned long t0 = millis();
   int code = apiHttp.GET();
-  out.respMillis = millis();
+  unsigned long tAfterGet = millis();
 
   if (code == 204) {           // tidak ada yang diputar
     apiHttp.end();
@@ -149,8 +149,10 @@ PollResult spotifyPoll(SpotifyTrack &out)
   String body = apiHttp.getString();
   apiHttp.end();               // koneksi tetap hidup (keep-alive)
 
-  // Kompensasi setengah waktu round-trip
-  out.respMillis = t0 + (out.respMillis - t0) / 2;
+  // Kompensasi one-way latency HTTP tanpa terpengaruh durasi TLS handshake (~2 detik)
+  uint32_t rtt = (uint32_t)(tAfterGet - t0);
+  uint32_t oneWay = min(rtt / 2, (uint32_t)150);
+  out.respMillis = tAfterGet - oneWay;
 
   JsonDocument filter;
   filter["is_playing"] = true;

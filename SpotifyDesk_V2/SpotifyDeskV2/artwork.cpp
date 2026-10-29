@@ -1,10 +1,11 @@
-// artwork.cpp — Album art downloader & dithering kualitas tinggi untuk ESP32
+// artwork.cpp — Album art downloader & HD dithering pipeline untuk ESP32
 //
-// FITUR KUALITAS TINGGI (Setara Desktop Companion V1 / PIL):
-// - Continuous sub-pixel area averaging (menghilangkan grid moiré & distorsi teks)
-// - Mean-centered contrast enhancement faktor 1.25 (identik PIL ImageEnhance.Contrast)
-// - Floyd-Steinberg dithering 16-fraction dengan error diffusion presisi tinggi
-// - Sangat hemat RAM: hanya 2 baris error buffer (bukan 18 KB) & heap-safe
+// FITUR KUALITAS TINGGI (HD E-Paper Rendering):
+// 1. Direct Full-Resolution 1:1 Streaming Area Averaging (tanpa blur JPEG_SCALE_HALF)
+// 2. Adaptive Soft Auto-Levels (Percentile Stretch) & Mean-Centered Contrast
+// 3. 3x3 Unsharp Mask (Edge Sharpening) agar teks & logo band tajam di 96x96
+// 4. Highlight/Shadow Clean-Clipping (background terang bersih dari bintik hitam)
+// 5. Serpentine Floyd-Steinberg Dithering (bebas artefak garis diagonal / worm)
 
 #include "artwork.h"
 #include <WiFi.h>
@@ -12,95 +13,146 @@
 #include <HTTPClient.h>
 #include <JPEGDEC.h>
 #include <new>
-#include <math.h>
+#include <string.h>
 
 static uint8_t grayBuf[COVER_SIZE * COVER_SIZE];
-static uint8_t *decoded = nullptr;
-static int outW = 0, outH = 0;
+static uint32_t *accBuf = nullptr;
+static int srcW = 0, srcH = 0;
+static int cropSide = 0, cropOx = 0, cropOy = 0;
 
+// Callback JPEGDEC: langsung mengakumulasi piksel resolusi penuh 1:1 (300x300)
+// ke grid 96x96 dengan bobot sub-piksel eksak (hanya butuh 36 KB heap, bukan 90 KB)
 static int jpegDraw(JPEGDRAW *d)
 {
+  if (!accBuf || cropSide <= 0) return 0;
+
   for (int y = 0; y < d->iHeight; y++) {
-    int dy = d->y + y;
-    if (dy >= outH) break;
+    int sy = d->y + y;
+    if (sy < cropOy || sy >= cropOy + cropSide) continue;
+
+    uint32_t uY = (uint32_t)(sy - cropOy) * COVER_SIZE;
+    uint32_t uYEnd = uY + COVER_SIZE;
     const uint16_t *row = d->pPixels + y * d->iWidth;
+
     for (int x = 0; x < d->iWidth; x++) {
-      int dx = d->x + x;
-      if (dx >= outW) break;
+      int sx = d->x + x;
+      if (sx < cropOx || sx >= cropOx + cropSide) continue;
+
       uint16_t px = row[x];
       // Konversi RGB565 ke RGB888
       uint32_t r = (px >> 11) & 0x1F, g = (px >> 5) & 0x3F, b = px & 0x1F;
-      r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); b = (b << 3) | (b >> 2);
-      // Grayscale BT.601 (identik dengan PIL Image.convert('L'))
-      decoded[dy * outW + dx] = (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
+      r = (r << 3) | (r >> 2);
+      g = (g << 2) | (g >> 4);
+      b = (b << 3) | (b >> 2);
+      // Luminance BT.601 (identik PIL Image.convert('L'))
+      uint32_t lum = (r * 77 + g * 150 + b * 29) >> 8;
+
+      uint32_t uX = (uint32_t)(sx - cropOx) * COVER_SIZE;
+      uint32_t uXEnd = uX + COVER_SIZE;
+
+      uint32_t yCur = uY;
+      while (yCur < uYEnd) {
+        uint32_t ty = yCur / (uint32_t)cropSide;
+        uint32_t yNext = (ty + 1) * (uint32_t)cropSide;
+        if (yNext > uYEnd) yNext = uYEnd;
+        uint32_t wy = yNext - yCur;
+
+        uint32_t xCur = uX;
+        uint32_t *accRow = accBuf + ty * COVER_SIZE;
+        while (xCur < uXEnd) {
+          uint32_t tx = xCur / (uint32_t)cropSide;
+          uint32_t xNext = (tx + 1) * (uint32_t)cropSide;
+          if (xNext > uXEnd) xNext = uXEnd;
+          uint32_t wx = xNext - xCur;
+
+          accRow[tx] += lum * wx * wy;
+          xCur = xNext;
+        }
+        yCur = yNext;
+      }
     }
   }
   return 1;
 }
 
-// Continuous sub-pixel area averaging downscale (kualitas setara LANCZOS/Box di PIL Python)
-static void resizeTo96(const uint8_t *src, int sw, int sh, uint8_t *dst)
-{
-  int side = min(sw, sh);
-  int ox = (sw - side) / 2;
-  int oy = (sh - side) / 2;
-  const float scale = (float)side / (float)COVER_SIZE;
-
-  for (int y = 0; y < COVER_SIZE; y++) {
-    float y_start = oy + y * scale;
-    float y_end   = oy + (y + 1) * scale;
-    int iy0 = (int)floorf(y_start);
-    int iy1 = (int)ceilf(y_end);
-    if (iy0 < 0) iy0 = 0;
-    if (iy1 > sh) iy1 = sh;
-
-    for (int x = 0; x < COVER_SIZE; x++) {
-      float x_start = ox + x * scale;
-      float x_end   = ox + (x + 1) * scale;
-      int ix0 = (int)floorf(x_start);
-      int ix1 = (int)ceilf(x_end);
-      if (ix0 < 0) ix0 = 0;
-      if (ix1 > sw) ix1 = sw;
-
-      float sumVal = 0.0f;
-      float weightSum = 0.0f;
-
-      for (int iy = iy0; iy < iy1; iy++) {
-        float wy = min(y_end, (float)(iy + 1)) - max(y_start, (float)iy);
-        if (wy <= 0.0f) continue;
-        const uint8_t *row = src + iy * sw;
-        for (int ix = ix0; ix < ix1; ix++) {
-          float wx = min(x_end, (float)(ix + 1)) - max(x_start, (float)ix);
-          if (wx <= 0.0f) continue;
-          float w = wx * wy;
-          sumVal += row[ix] * w;
-          weightSum += w;
-        }
-      }
-      dst[y * COVER_SIZE + x] = (weightSum > 0.0f) ? (uint8_t)(sumVal / weightSum + 0.5f) : 128;
-    }
-  }
-}
-
-static void ditherToMono(uint8_t *gray, uint8_t *bitmap)
+static void enhanceAndDither(uint8_t *gray, uint8_t *tmpBuf, uint8_t *bitmap)
 {
   const int N = COVER_SIZE * COVER_SIZE;
 
-  // 1. Hitung brightness rata-rata (mean) persis seperti PIL ImageEnhance.Contrast
-  uint32_t sum = 0;
-  for (int i = 0; i < N; i++) sum += gray[i];
-  int mean = (int)((sum + N / 2) / N);
+  // 1. Hitung histogram untuk Adaptive Soft Auto-Levels (1.5% - 98.5% percentile)
+  uint16_t hist[256] = {0};
+  for (int i = 0; i < N; i++) hist[gray[i]]++;
 
-  // 2. Contrast enhancement faktor 1.25 (mean-centered)
-  // v = mean + 1.25 * (gray[i] - mean) = mean + ((gray[i] - mean) * 5) / 4
+  int pLow = 0, pHigh = 255;
+  int acc = 0;
+  for (int i = 0; i < 256; i++) {
+    acc += hist[i];
+    if (acc >= (N * 15) / 1000) { pLow = i; break; }
+  }
+  acc = 0;
+  for (int i = 255; i >= 0; i--) {
+    acc += hist[i];
+    if (acc >= (N * 15) / 1000) { pHigh = i; break; }
+  }
+
+  // Blend 50% dengan rentang penuh [0, 255] agar cover low-key tidak kehilangan nuansa
+  int blackPt = pLow / 2;
+  int whitePt = 255 - (255 - pHigh) / 2;
+  if (whitePt - blackPt < 100) {
+    blackPt = 0;
+    whitePt = 255;
+  }
+
+  uint32_t sum = 0;
+  int span = whitePt - blackPt;
+  for (int i = 0; i < N; i++) {
+    int v = ((int)gray[i] - blackPt) * 255 / span;
+    if (v < 0) v = 0;
+    else if (v > 255) v = 255;
+    gray[i] = (uint8_t)v;
+    sum += (uint32_t)v;
+  }
+
+  // 2. Mean-centered contrast boost (1.25x)
+  int mean = (int)((sum + N / 2) / N);
   for (int i = 0; i < N; i++) {
     int v = mean + (((int)gray[i] - mean) * 5) / 4;
     if (v < 0) v = 0;
     else if (v > 255) v = 255;
-    gray[i] = (uint8_t)v;
+    tmpBuf[i] = (uint8_t)v;
   }
 
-  // 3. Floyd-Steinberg dithering (bit 1 = hitam di GxEPD / SSD1680)
+  // 3. 3x3 Unsharp Mask (Edge Sharpening) + Highlight/Shadow Clean-Clipping
+  for (int y = 0; y < COVER_SIZE; y++) {
+    int ym1 = (y > 0) ? (y - 1) : 0;
+    int yp1 = (y + 1 < COVER_SIZE) ? (y + 1) : (COVER_SIZE - 1);
+    for (int x = 0; x < COVER_SIZE; x++) {
+      int xm1 = (x > 0) ? (x - 1) : 0;
+      int xp1 = (x + 1 < COVER_SIZE) ? (x + 1) : (COVER_SIZE - 1);
+
+      int c = tmpBuf[y * COVER_SIZE + x];
+      int blur = (4 * c +
+                  2 * (tmpBuf[ym1 * COVER_SIZE + x] +
+                       tmpBuf[yp1 * COVER_SIZE + x] +
+                       tmpBuf[y * COVER_SIZE + xm1] +
+                       tmpBuf[y * COVER_SIZE + xp1]) +
+                  tmpBuf[ym1 * COVER_SIZE + xm1] +
+                  tmpBuf[ym1 * COVER_SIZE + xp1] +
+                  tmpBuf[yp1 * COVER_SIZE + xm1] +
+                  tmpBuf[yp1 * COVER_SIZE + xp1] + 8) >> 4;
+
+      // Ketajaman 0.625x (5/8) untuk mempertegas teks & garis logo tanpa halo berlebih
+      int v = c + ((c - blur) * 5) / 8;
+
+      // Clean-clip area sangat terang & sangat gelap agar putih bersih bebas bintik
+      if (v >= 244) v = 255;
+      else if (v <= 10) v = 0;
+
+      gray[y * COVER_SIZE + x] = (uint8_t)v;
+    }
+  }
+
+  // 4. Serpentine Floyd-Steinberg Dithering (bolak-balik tiap baris, bebas garis cacing/worm)
   static int16_t errA[COVER_SIZE + 2], errB[COVER_SIZE + 2];
   int16_t *cur = errA, *nxt = errB;
   memset(errA, 0, sizeof(errA));
@@ -108,15 +160,30 @@ static void ditherToMono(uint8_t *gray, uint8_t *bitmap)
 
   for (int y = 0; y < COVER_SIZE; y++) {
     memset(nxt, 0, sizeof(errA));
-    for (int x = 0; x < COVER_SIZE; x++) {
-      int v = gray[y * COVER_SIZE + x] + cur[x + 1];
-      int nv = v >= 128 ? 255 : 0;
-      int e = v - nv;
-      if (nv == 0) bitmap[(y * COVER_SIZE + x) >> 3] |= (0x80 >> (x & 7)); // 1 = hitam
-      cur[x + 2] += (e * 7) / 16;
-      nxt[x]     += (e * 3) / 16;
-      nxt[x + 1] += (e * 5) / 16;
-      nxt[x + 2] += (e * 1) / 16;
+    if ((y & 1) == 0) {
+      // Baris genap: kiri ke kanan
+      for (int x = 0; x < COVER_SIZE; x++) {
+        int v = gray[y * COVER_SIZE + x] + cur[x + 1];
+        int nv = (v >= 128) ? 255 : 0;
+        int e = v - nv;
+        if (nv == 0) bitmap[(y * COVER_SIZE + x) >> 3] |= (0x80 >> (x & 7));
+        cur[x + 2] += (e * 7) / 16;
+        nxt[x]     += (e * 3) / 16;
+        nxt[x + 1] += (e * 5) / 16;
+        nxt[x + 2] += (e * 1) / 16;
+      }
+    } else {
+      // Baris ganjil: kanan ke kiri (serpentine)
+      for (int x = COVER_SIZE - 1; x >= 0; x--) {
+        int v = gray[y * COVER_SIZE + x] + cur[x + 1];
+        int nv = (v >= 128) ? 255 : 0;
+        int e = v - nv;
+        if (nv == 0) bitmap[(y * COVER_SIZE + x) >> 3] |= (0x80 >> (x & 7));
+        cur[x]     += (e * 7) / 16;
+        nxt[x + 2] += (e * 3) / 16;
+        nxt[x + 1] += (e * 5) / 16;
+        nxt[x]     += (e * 1) / 16;
+      }
     }
     int16_t *t = cur; cur = nxt; nxt = t;
   }
@@ -166,7 +233,7 @@ bool artworkDownload(const char *url, uint8_t *coverBitmap)
     }
   }
   http.end();
-  client.stop(); // bebaskan RAM TLS sebelum decode
+  client.stop(); // bebaskan ~40KB RAM TLS sebelum decode
 
   if (got < 500) {
     Serial.printf("[Art] data terlalu kecil (%u)\n", got);
@@ -179,25 +246,32 @@ bool artworkDownload(const char *url, uint8_t *coverBitmap)
 
   bool ok = false;
   if (jpeg->openRAM(jpg, got, jpegDraw)) {
-    int w = jpeg->getWidth(), h = jpeg->getHeight();
-    int scale = 0, div = 1;
-    if (w >= 480)      { scale = JPEG_SCALE_QUARTER; div = 4; }
-    else if (w >= 200) { scale = JPEG_SCALE_HALF;    div = 2; }
-    outW = (w + div - 1) / div;
-    outH = (h + div - 1) / div;
-    decoded = (uint8_t *)malloc(outW * outH);
-    if (decoded) {
-      memset(decoded, 255, outW * outH);
+    srcW = jpeg->getWidth();
+    srcH = jpeg->getHeight();
+    cropSide = min(srcW, srcH);
+    cropOx = (srcW - cropSide) / 2;
+    cropOy = (srcH - cropSide) / 2;
+
+    accBuf = (uint32_t *)calloc(COVER_SIZE * COVER_SIZE, sizeof(uint32_t));
+    if (accBuf && cropSide >= COVER_SIZE) {
       jpeg->setPixelType(RGB565_LITTLE_ENDIAN);
-      if (jpeg->decode(0, 0, scale)) {
-        resizeTo96(decoded, outW, outH, grayBuf);
-        ditherToMono(grayBuf, coverBitmap);
+      // Decode pada skala 0 (resolusi penuh 1:1, tanpa blur JPEG_SCALE_HALF)
+      if (jpeg->decode(0, 0, 0)) {
+        uint32_t totalW = (uint32_t)cropSide * (uint32_t)cropSide;
+        for (int i = 0; i < COVER_SIZE * COVER_SIZE; i++) {
+          grayBuf[i] = (uint8_t)((accBuf[i] + (totalW >> 1)) / totalW);
+        }
+        // Gunakan byte awal accBuf sebagai buffer sementara untuk unsharp mask
+        enhanceAndDither(grayBuf, (uint8_t *)accBuf, coverBitmap);
         ok = true;
       } else {
         Serial.printf("[Art] decode gagal (%d)\n", jpeg->getLastError());
       }
-      free(decoded);
-      decoded = nullptr;
+      free(accBuf);
+      accBuf = nullptr;
+    } else if (accBuf) {
+      free(accBuf);
+      accBuf = nullptr;
     }
     jpeg->close();
   } else {

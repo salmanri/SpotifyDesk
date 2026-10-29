@@ -15,6 +15,7 @@ int lyricsFetch(const char *title, const char *artist, const char *album, int du
 
 // Dipanggil dari task display. Menyalin lirik aktif ke buffer out.
 void lyricsGetCurrent(uint32_t positionMs, int leadMs, char *out, size_t outLen);
+uint32_t lyricsGetNextChangeMs(uint32_t positionMs, int leadMs);
 
 void lyricsReset();
 bool lyricsLoaded();
